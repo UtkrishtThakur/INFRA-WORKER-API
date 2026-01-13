@@ -1,5 +1,6 @@
-import json
 import logging
+import time
+import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -12,42 +13,49 @@ from rate_limit import check_rate_limit
 from ml import compute_risk_score
 from decision import make_decision, Decision
 from proxy import forward_request
+from traffic_logger import emit_traffic_event
+
 
 # =========================
-# Setup
+# App Setup
 # =========================
 
-app = FastAPI(title="Infra Worker API")
+app = FastAPI(title="SecureX Worker")
 
-# Configure JSON logging for stdout (Infrastructure will capture this)
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("traffic")
+logger = logging.getLogger("securex.worker")
 
-class TrafficLogEntry(BaseModel):
+
+# =========================
+# Request Context (FACTS ONLY)
+# =========================
+
+class RequestContext(BaseModel):
     timestamp: str
     project_id: str
-    host: str
-    ip: str
-    path: str
+    api_key_hash: str
+
     method: str
-    status: int
+    path: str
+    normalized_path: str
+
+    ip: str
+    user_agent: Optional[str]
+
     risk_score: float
     decision: str
-    blocked: bool
-    reason: Optional[str] = None
+    reason: Optional[str]
+
+    status_code: int
+    latency_ms: int
+
 
 # =========================
-# Startup (FAIL CLOSED)
+# Startup
 # =========================
 
 @app.on_event("startup")
 async def startup():
-    """
-    Worker Startup Lifecycle:
-    1. Start background config refresh.
-       - Does NOT block startup.
-       - Worker starts serving immediately (empty config until first fetch).
-    """
     config_manager.start_background_refresh()
 
 
@@ -57,21 +65,15 @@ async def startup():
 
 @app.get("/health")
 def health_check():
-    # If ConfigManager isn't ready, we are effectively unhealthy (though startup should block)
     try:
-        # A simple check to ensure we can read config
         _ = config_manager.get_instance()
+        return {"status": "ok"}
     except Exception:
-         return {"status": "initializing"}
-
-    return {
-        "status": "ok",
-        "worker_type": "stateless",
-    }
+        return {"status": "initializing"}
 
 
 # =========================
-# Gateway (HOST-BASED)
+# Gateway
 # =========================
 
 @app.api_route(
@@ -83,69 +85,114 @@ async def gateway(
     request: Request,
     raw_api_key: str = Depends(extract_api_key),
 ):
-    # 1️⃣ Validate + hash API key
-    api_key_hash = validate_api_key(raw_api_key)
+    start_time = time.monotonic()
 
-    # 2️⃣ Resolve project by API key
+    # ---- Auth ----
+    api_key_hash = validate_api_key(raw_api_key)
     project_config = config_manager.get_project_by_key(api_key_hash)
 
     if not project_config:
-        logger.warning("Invalid API key used")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # 3️⃣ Client IP
+    # ---- Request Info ----
     client_ip = request.client.host
+    user_agent = request.headers.get("user-agent")
+    normalized_path = normalize_path(path)
 
-    # 4️⃣ Rate limiting
+    # ---- Rate Limit ----
     rate_allowed, remaining = check_rate_limit(
         api_key_hash=api_key_hash,
         ip_address=client_ip,
+        endpoint=normalized_path,
     )
 
-    # 5️⃣ ML risk
-    risk_data = compute_risk_score(
+    # ---- ML Brain ----
+    ml_result = compute_risk_score(
         api_key_hash=api_key_hash,
         ip_address=client_ip,
-        path=path,
+        endpoint=normalized_path,
     )
-    ml_risk_score = risk_data["score"]
 
-    # 6️⃣ Decision
+    risk_score = ml_result["risk_score"]
+
+    # ---- Decision ----
     decision_result = make_decision(
         rate_limit_allowed=rate_allowed,
         remaining_requests=remaining,
-        ml_risk_score=ml_risk_score,
+        ml_risk_score=risk_score,
     )
 
     decision = decision_result["decision"]
-    blocked = (decision == Decision.BLOCK)
+    reason = decision_result.get("reason")
 
-    # 7️⃣ Log
-    log_entry = TrafficLogEntry(
-        timestamp=datetime.utcnow().isoformat(),
-        project_id=project_config.project_id,
-        host="gateway",
-        ip=client_ip,
-        path=path,
-        method=request.method,
-        status=429 if blocked else 200,
-        risk_score=ml_risk_score,
-        decision=decision.value,
-        blocked=blocked,
-        reason=decision_result.get("reason"),
-    )
-    logger.info(log_entry.json())
+    # ---- Progressive Enforcement ----
+    if decision == Decision.THROTTLE:
+        # MVP throttling: deterministic delay
+        await asyncio.sleep(0.3)
 
-    if blocked:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=decision_result.get("reason", "Request blocked"),
+    if decision == Decision.BLOCK:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+
+        ctx = RequestContext(
+            timestamp=datetime.utcnow().isoformat(),
+            project_id=project_config.project_id,
+            api_key_hash=api_key_hash,
+            method=request.method,
+            path=path,
+            normalized_path=normalized_path,
+            ip=client_ip,
+            user_agent=user_agent,
+            risk_score=risk_score,
+            decision=decision.value,
+            reason=reason,
+            status_code=429,
+            latency_ms=latency_ms,
         )
 
-    # 8️⃣ Forward
-    upstream_url = f"{project_config.upstream_base_url.rstrip('/')}/{path}"
+        logger.info(ctx.json())
+        asyncio.create_task(emit_traffic_event(ctx.dict()))
 
-    return await forward_request(
-        request=request,
-        upstream_url=upstream_url,
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=reason or "Request blocked",
+        )
+
+    # ---- Forward ----
+    upstream_url = f"{project_config.upstream_base_url.rstrip('/')}/{path}"
+    response = await forward_request(request=request, upstream_url=upstream_url)
+
+    latency_ms = int((time.monotonic() - start_time) * 1000)
+
+    # ---- Emit Success Event ----
+    ctx = RequestContext(
+        timestamp=datetime.utcnow().isoformat(),
+        project_id=project_config.project_id,
+        api_key_hash=api_key_hash,
+        method=request.method,
+        path=path,
+        normalized_path=normalized_path,
+        ip=client_ip,
+        user_agent=user_agent,
+        risk_score=risk_score,
+        decision=decision.value,
+        reason=None,
+        status_code=response.status_code,
+        latency_ms=latency_ms,
+    )
+
+    logger.info(ctx.json())
+    asyncio.create_task(emit_traffic_event(ctx.dict()))
+
+    return response
+
+
+# =========================
+# Utils
+# =========================
+
+def normalize_path(path: str) -> str:
+    return "/" + "/".join(
+        ":id" if segment.isdigit() else segment
+        for segment in path.split("/")
+        if segment
     )

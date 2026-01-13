@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Dict
+from typing import Optional
 
 
 class DecisionMetadata(BaseModel):
@@ -8,8 +8,8 @@ class DecisionMetadata(BaseModel):
 
 
 class DecisionResponse(BaseModel):
-    decision: str
-    reason: str
+    decision: str          # ALLOW | THROTTLE | BLOCK
+    reason: Optional[str]  # human-readable enum
     metadata: DecisionMetadata
 
 

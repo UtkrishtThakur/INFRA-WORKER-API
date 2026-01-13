@@ -15,56 +15,66 @@ def make_decision(
     ml_risk_score: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Combine all security signals and return a final decision.
+    Progressive decision engine.
 
-    Inputs:
-    - rate_limit_allowed: result from rate limiter
-    - remaining_requests: remaining quota in current window
-    - ml_risk_score: anomaly score (0.0 - 1.0)
-
-    Output:
-    - decision: ALLOW | THROTTLE | BLOCK
-    - reason: human-readable explanation
-    - metadata: structured info for logs / dashboards
+    Philosophy:
+    - Allow by default
+    - Throttle when behavior drifts
+    - Block only when clearly abusive
     """
 
-    # ---- HARD BLOCK CONDITIONS ----
+    # -------------------------
+    # HARD BLOCK (Confirmed Abuse)
+    # -------------------------
     if not rate_limit_allowed:
         return {
             "decision": Decision.BLOCK,
-            "reason": "Rate limit exceeded",
+            "reason": "Confirmed abuse: rate limit exceeded",
             "metadata": {
                 "remaining_requests": remaining_requests,
                 "risk_score": ml_risk_score,
             },
         }
 
-    # ---- ML-BASED BLOCK (future expansion) ----
     if ml_risk_score >= 0.9:
         return {
             "decision": Decision.BLOCK,
-            "reason": "High risk traffic detected",
+            "reason": "Confirmed abuse: high risk behavior",
             "metadata": {
                 "remaining_requests": remaining_requests,
                 "risk_score": ml_risk_score,
             },
         }
 
-    # ---- THROTTLE ZONE ----
+    # -------------------------
+    # SOFT ENFORCEMENT (Early Warning)
+    # -------------------------
     if ml_risk_score >= 0.6:
         return {
             "decision": Decision.THROTTLE,
-            "reason": "Suspicious traffic pattern",
+            "reason": "Abnormal usage pattern detected",
             "metadata": {
                 "remaining_requests": remaining_requests,
                 "risk_score": ml_risk_score,
             },
         }
 
-    # ---- DEFAULT ALLOW ----
+    if remaining_requests <= 5:
+        return {
+            "decision": Decision.THROTTLE,
+            "reason": "Approaching rate limit",
+            "metadata": {
+                "remaining_requests": remaining_requests,
+                "risk_score": ml_risk_score,
+            },
+        }
+
+    # -------------------------
+    # DEFAULT (Healthy Traffic)
+    # -------------------------
     return {
         "decision": Decision.ALLOW,
-        "reason": "Request allowed",
+        "reason": "Usage within expected behavior",
         "metadata": {
             "remaining_requests": remaining_requests,
             "risk_score": ml_risk_score,

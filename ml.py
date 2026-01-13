@@ -4,69 +4,69 @@ from typing import Dict
 from redis_client import redis_client
 
 
-# ---- CONFIG (v1 heuristics) ----
-REQ_RATE_THRESHOLD = 30          # requests per minute per IP
-NEW_IP_WEIGHT = 0.3
-RATE_SPIKE_WEIGHT = 0.4
-PATH_ABUSE_WEIGHT = 0.3
-
-
-def _minute_bucket() -> int:
-    return int(time.time() // 60)
-
-
-def _ip_rate_key(api_key_hash: str, ip: str) -> str:
-    return f"ml:ip_rate:{api_key_hash}:{ip}:{_minute_bucket()}"
-
-
-def _path_key(api_key_hash: str, path: str) -> str:
-    return f"ml:path:{api_key_hash}:{path}:{_minute_bucket()}"
+WINDOW_SECONDS = 60
 
 
 def compute_risk_score(
     *,
     api_key_hash: str,
     ip_address: str,
-    path: str,
-) -> Dict[str, float]:
+    endpoint: str,
+) -> Dict[str, any]:
     """
-    Compute a behavioral risk score for the request.
-
-    Returns:
-        {
-          "score": float (0.0 - 1.0),
-          "ip_rate": int,
-          "path_hits": int
-        }
+    Compute multi-signal behavior risk score.
     """
 
-    score = 0.0
+    signals = {}
 
-    score = 0.0
+    # -------------------------
+    # 1. Velocity Signal
+    # -------------------------
+    velocity_key = f"ml:velocity:{api_key_hash}:{ip_address}:{endpoint}"
+    velocity = redis_client.incr(velocity_key)
+    if velocity == 1:
+        redis_client.expire(velocity_key, WINDOW_SECONDS)
 
-    # ---- IP RATE FEATURE ----
-    ip_key = _ip_rate_key(api_key_hash, ip_address)
-    ip_rate = redis_client.incr(ip_key)
-    if ip_rate == 1:
-        redis_client.expire(ip_key, 60)
+    velocity_score = min(velocity / 30.0, 1.0)
+    signals["velocity"] = velocity_score
 
-    if ip_rate > REQ_RATE_THRESHOLD:
-        score += RATE_SPIKE_WEIGHT
+    # -------------------------
+    # 2. Burst Signal
+    # -------------------------
+    burst_score = 1.0 if velocity > 20 else velocity / 20.0
+    signals["burst"] = burst_score
 
-    # ---- PATH ABUSE FEATURE ----
-    path_key = _path_key(api_key_hash, path)
-    path_hits = redis_client.incr(path_key)
-    if path_hits == 1:
-        redis_client.expire(path_key, 60)
+    # -------------------------
+    # 3. Endpoint Drift Signal
+    # -------------------------
+    drift_key = f"ml:endpoints:{api_key_hash}:{ip_address}"
+    redis_client.sadd(drift_key, endpoint)
+    redis_client.expire(drift_key, WINDOW_SECONDS)
 
-    if path_hits > (REQ_RATE_THRESHOLD // 2):
-        score += PATH_ABUSE_WEIGHT
+    endpoint_count = redis_client.scard(drift_key)
+    drift_score = min(endpoint_count / 5.0, 1.0)
+    signals["endpoint_drift"] = drift_score
 
-    # ---- CLAMP SCORE ----
-    score = min(score, 1.0)
+    # -------------------------
+    # 4. Fanout Signal (future-ready)
+    # -------------------------
+    # Placeholder for Control API aggregation
+    fanout_score = 0.0
+    signals["fanout"] = fanout_score
+
+    # -------------------------
+    # Final Risk Score (Weighted)
+    # -------------------------
+    risk_score = (
+        0.4 * velocity_score +
+        0.3 * burst_score +
+        0.3 * drift_score
+    )
+
+    primary_reason = max(signals, key=signals.get)
 
     return {
-        "score": score,
-        "ip_rate": ip_rate,
-        "path_hits": path_hits,
+        "risk_score": round(risk_score, 2),
+        "signals": signals,
+        "primary_reason": primary_reason,
     }
