@@ -4,18 +4,19 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import hashlib
+
 # Mock Redis before importing app modules that use it
 with patch("redis.Redis") as mock_redis:
     from main import app
-    from config_manager import config_manager, DomainConfig
+    from config_manager import config_manager, ProjectConfig
     from decision import Decision
 
 client = TestClient(app)
 
 # Mock Data
-VALID_HOST = "api.example.com"
-VALID_KEY = "test-key-123"
-VALID_KEY_HASH = "8facc86a1005a8f2730ca74cd6622ec92b3c7b3967d74f266c2dbf37b605af6c" # sha256 of test-key-123
+VALID_KEY = "test-key-123-must-be-longer-than-20-chars"
+VALID_KEY_HASH = hashlib.sha256(VALID_KEY.encode()).hexdigest()
 PROJECT_ID = "proj_123"
 UPSTREAM_URL = "http://backend.internal"
 
@@ -29,75 +30,66 @@ async def test_startup_fail_closed():
 @pytest.mark.asyncio
 async def test_startup_success():
     """Ensure worker loads config correctly"""
-    mock_data = [{
-        "hostname": VALID_HOST,
-        "project_id": PROJECT_ID,
-        "upstream_base_url": UPSTREAM_URL,
-        "api_key_hashes": [VALID_KEY_HASH]
-    }]
+    # Structure of /internal/worker/config response
+    mock_data = {
+        "projects": [
+            {
+                "id": PROJECT_ID,
+                "upstream_url": UPSTREAM_URL,
+                "api_keys": [VALID_KEY_HASH]
+            }
+        ]
+    }
     
     # Mock the HTTP call inside _fetch_and_update
     with patch("httpx.AsyncClient.get") as mock_get:
         mock_get.return_value = MagicMock(status_code=200, json=lambda: mock_data)
         await config_manager.initialize()
         
-    assert config_manager.get_domain_config(VALID_HOST) is not None
-
-def test_unknown_domain():
-    """404 for unknown host"""
-    # config_manager state is global, assumed initialized from previous test if running sequence, 
-    # but better to force clean state or mock get_domain_config
-    
-    with patch.object(config_manager, "get_domain_config", return_value=None):
-        resp = client.get("/foo", headers={"Host": "unknown.com", "X-API-Key": VALID_KEY})
-        assert resp.status_code == 404
-        assert "Unknown domain" in resp.json()["detail"]
+    assert config_manager.get_project_by_key(VALID_KEY_HASH) is not None
 
 def test_missing_api_key():
     """401 for missing key"""
-    with patch.object(config_manager, "get_domain_config", return_value=MagicMock()):
-        resp = client.get("/foo", headers={"Host": VALID_HOST})
-        assert resp.status_code == 401
+    resp = client.get("/foo", headers={})
+    assert resp.status_code == 401
+    assert "API key missing" in resp.json()["detail"]
 
 def test_invalid_api_key():
     """401 for invalid key"""
-    domain_config = DomainConfig(
-        project_id=PROJECT_ID,
-        upstream_base_url=UPSTREAM_URL,
-        api_key_hashes={VALID_KEY_HASH}, # Set
-        hostname=VALID_HOST
-    )
+    # Mock validation passing hashing but config lookup failing
     
-    with patch.object(config_manager, "get_domain_config", return_value=domain_config):
-        resp = client.get("/foo", headers={"Host": VALID_HOST, "X-API-Key": "wrong-key"})
-        assert resp.status_code == 401
+    with patch("main.validate_api_key", return_value="bad_hash"):
+        with patch.object(config_manager, "get_project_by_key", return_value=None):
+            resp = client.get("/foo", headers={"X-API-Key": "wrong-key"})
+            assert resp.status_code == 401
+            assert "Invalid API key" in resp.json()["detail"]
 
 @patch("main.forward_request")
 @patch("main.check_rate_limit")
 @patch("main.compute_risk_score")
 @patch("main.make_decision")
 def test_happy_path(mock_decision, mock_risk, mock_limit, mock_forward):
-    """Full flow: Host -> Auth -> RateLimit -> ML -> Decision -> Proxy"""
+    """Full flow: Auth -> RateLimit -> ML -> Decision -> Proxy"""
     
     # Setup Mocks
-    domain_config = DomainConfig(
+    project_config = ProjectConfig(
         project_id=PROJECT_ID,
         upstream_base_url=UPSTREAM_URL,
-        api_key_hashes={VALID_KEY_HASH},
-        hostname=VALID_HOST
+        api_key_hash=VALID_KEY_HASH
     )
     
     mock_limit.return_value = (True, 100)
-    mock_risk.return_value = {"score": 0.1}
+    mock_risk.return_value = {"risk_score": 0.1} # Adjusted to match key usage
     mock_decision.return_value = {"decision": Decision.ALLOW}
-    mock_forward.return_value = MagicMock(status_code=200) # Simple mock response
+    mock_forward.return_value = MagicMock(status_code=200) 
     
-    # Request
-    with patch.object(config_manager, "get_domain_config", return_value=domain_config):
-        resp = client.get("/users/123", headers={"Host": VALID_HOST, "X-API-Key": VALID_KEY})
+    # Needs to match main.py expectations
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        resp = client.get("/users/123", headers={"X-API-Key": VALID_KEY})
         
         # Assertions
-        assert resp.status_code == 200 # Since mock_forward returns a MagicMock which verify_worker might interpret
+        assert resp.status_code == 200
         
         # Verify proxy call args
         call_args = mock_forward.call_args
@@ -105,10 +97,52 @@ def test_happy_path(mock_decision, mock_risk, mock_limit, mock_forward):
         _, kwargs = call_args
         assert kwargs["upstream_url"] == f"{UPSTREAM_URL}/users/123"
 
-# Run logic
+@pytest.mark.asyncio
+async def test_no_involuntary_query_validation():
+    """
+    Ensure the gateway does NOT require a 'request' query parameter.
+    This validates the fix for 'Field required' in query.
+    """
+    print("\n--- STARTING test_no_involuntary_query_validation ---")
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        with patch("main.forward_request") as mock_forward:
+            mock_forward.return_value = MagicMock(status_code=200)
+            
+            with patch("main.check_rate_limit", return_value=(True, 100)):
+                with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                    with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                        
+                        resp = client.post(
+                            "/auth/login", 
+                            headers={"X-API-Key": VALID_KEY},
+                            json={"username": "foo", "password": "bar"}
+                        )
+                        
+                        print(f"Response Status: {resp.status_code}")
+                        print(f"Response Body: {resp.text}")
+                        
+                        if resp.status_code == 422:
+                            print("FAILURE: Got 422. Fix did not work.")
+                        elif resp.status_code != 200:
+                            print(f"FAILURE: Got {resp.status_code}.")
+                        else:
+                            print("SUCCESS: Got 200.")
+
+                        assert resp.status_code == 200, f"Got error: {resp.text}"
+
 if __name__ == "__main__":
+    import asyncio
     import sys
-    # We can't easily run pytest from inside the script without installing it, 
-    # but we can try to run simple assertions manually if pytest isn't there.
-    # However, user likely has pytest. Let's try running via command line.
-    print("Please run: pytest verify_worker.py")
+    try:
+        asyncio.run(test_no_involuntary_query_validation())
+        print("Test Passed: test_no_involuntary_query_validation")
+    except Exception as e:
+        print(f"Test Failed: {e}")
+        # traceback.print_exc() # skip traceback to keep output clean, we rely on prints above
+    sys.stdout.flush()

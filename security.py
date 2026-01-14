@@ -1,11 +1,11 @@
 import hashlib
-from fastapi import HTTPException, status
+from fastapi import HTTPException, status, Request
 
 # =========================
 # API KEY EXTRACTION
 # =========================
 
-def extract_api_key(request) -> str:
+def extract_api_key(request: Request) -> str:
     """
     Extract API key from request headers.
     Header: X-API-Key
