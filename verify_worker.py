@@ -60,7 +60,7 @@ def test_invalid_api_key():
     
     with patch("main.validate_api_key", return_value="bad_hash"):
         with patch.object(config_manager, "get_project_by_key", return_value=None):
-            resp = client.get("/foo", headers={"X-API-Key": "wrong-key"})
+            resp = client.get("/foo", headers={"x-securex-api-key": "wrong-key"})
             assert resp.status_code == 401
             assert "Invalid API key" in resp.json()["detail"]
 
@@ -86,7 +86,7 @@ def test_happy_path(mock_decision, mock_risk, mock_limit, mock_forward):
     # Needs to match main.py expectations
     
     with patch.object(config_manager, "get_project_by_key", return_value=project_config):
-        resp = client.get("/users/123", headers={"X-API-Key": VALID_KEY})
+        resp = client.get("/users/123", headers={"x-securex-api-key": VALID_KEY})
         
         # Assertions
         assert resp.status_code == 200
@@ -120,7 +120,7 @@ async def test_no_involuntary_query_validation():
                         
                         resp = client.post(
                             "/auth/login", 
-                            headers={"X-API-Key": VALID_KEY},
+                            headers={"x-securex-api-key": VALID_KEY},
                             json={"username": "foo", "password": "bar"}
                         )
                         
