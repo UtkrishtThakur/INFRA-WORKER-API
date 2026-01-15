@@ -136,13 +136,75 @@ async def test_no_involuntary_query_validation():
 
                         assert resp.status_code == 200, f"Got error: {resp.text}"
 
+@pytest.mark.asyncio
+async def test_traffic_logging_fire_and_forget():
+    """
+    Ensure traffic logging is attempted and doesn't break request on failure.
+    """
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+         # Mock traffic logger's internal http client
+         with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            # We want to verify it IS called.
+            # Since it's a background task, we might need to wait or rely on test client's context?
+            # FastAPI TestClient runs the app in the same thread/loop usually, but background tasks 
+            # might need explicit handling or just time.
+            
+            with patch("main.forward_request", return_value=MagicMock(status_code=200)):
+                with patch("main.check_rate_limit", return_value=(True, 100)):
+                    with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                         with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                            
+                            client.get("/logs/test", headers={"x-securex-api-key": VALID_KEY})
+                            
+                            # Give asyncio a moment to schedule the background task
+                            await asyncio.sleep(0.1)
+                            
+                            assert mock_post.called
+                            ctx = mock_post.call_args[1]["json"]
+                            # FastAPI {path:path} param usually excludes leading slash
+                            assert ctx["path"] == "logs/test" 
+                            assert ctx["project_id"] == PROJECT_ID
+                            # Validates normalized path logic roughly
+                            assert ctx["normalized_path"] == "/logs/test"
+
+@pytest.mark.asyncio
+async def test_traffic_logging_swallows_error():
+    """
+    Ensure worker stays up even if logging API is down.
+    """
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+         with patch("httpx.AsyncClient.post", side_effect=Exception("Connection Refused")) as mock_post:
+            with patch("main.forward_request", return_value=MagicMock(status_code=200)):
+                 with patch("main.check_rate_limit", return_value=(True, 100)):
+                    with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                         with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                            
+                            resp = client.get("/logs/fail", headers={"x-securex-api-key": VALID_KEY})
+                            
+                            # Request should still succeed
+                            assert resp.status_code == 200
+
 if __name__ == "__main__":
     import asyncio
     import sys
     try:
-        asyncio.run(test_no_involuntary_query_validation())
-        print("Test Passed: test_no_involuntary_query_validation")
+        asyncio.run(test_traffic_logging_fire_and_forget())
+        asyncio.run(test_traffic_logging_swallows_error())
+        print("Tests Passed: Traffic Logging")
     except Exception as e:
         print(f"Test Failed: {e}")
-        # traceback.print_exc() # skip traceback to keep output clean, we rely on prints above
+        import traceback
+        traceback.print_exc() 
     sys.stdout.flush()
