@@ -171,7 +171,7 @@ async def test_traffic_logging_fire_and_forget():
                             assert ctx["path"] == "logs/test" 
                             assert ctx["project_id"] == PROJECT_ID
                             # Validates normalized path logic roughly
-                            assert ctx["normalized_path"] == "/logs/test"
+                            assert ctx["endpoint"] == "/logs/test"
 
 @pytest.mark.asyncio
 async def test_traffic_logging_swallows_error():

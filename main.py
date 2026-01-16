@@ -37,7 +37,7 @@ class RequestContext(BaseModel):
 
     method: str
     path: str
-    normalized_path: str
+    endpoint: str  # Renamed from normalized_path for Control API alignment
 
     ip: str
     user_agent: Optional[str]
@@ -92,6 +92,28 @@ async def gateway(
     project_config = config_manager.get_project_by_key(api_key_hash)
 
     if not project_config:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        normalized_path = normalize_path(path)
+        
+        # Emit traffic event for 401 auth failures
+        ctx = RequestContext(
+            timestamp=datetime.utcnow().isoformat(),
+            project_id="unknown",
+            api_key_hash=api_key_hash,
+            method=request.method,
+            path=path,
+            endpoint=normalized_path,
+            ip=request.client.host,
+            user_agent=request.headers.get("user-agent"),
+            risk_score=0.0,
+            decision=Decision.BLOCK.value,
+            reason="Invalid API key",
+            status_code=401,
+            latency_ms=latency_ms,
+        )
+        logger.info(ctx.json())
+        asyncio.create_task(emit_traffic_event(ctx.dict()))
+        
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     # ---- Request Info ----
@@ -139,7 +161,7 @@ async def gateway(
             api_key_hash=api_key_hash,
             method=request.method,
             path=path,
-            normalized_path=normalized_path,
+            endpoint=normalized_path,
             ip=client_ip,
             user_agent=user_agent,
             risk_score=risk_score,
@@ -159,7 +181,33 @@ async def gateway(
 
     # ---- Forward ----
     upstream_url = f"{project_config.upstream_base_url.rstrip('/')}/{path}"
-    response = await forward_request(request=request, upstream_url=upstream_url)
+    
+    try:
+        response = await forward_request(request=request, upstream_url=upstream_url)
+    except HTTPException as e:
+        # Capture 502 Bad Gateway errors
+        if e.status_code == 502:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            
+            ctx = RequestContext(
+                timestamp=datetime.utcnow().isoformat(),
+                project_id=project_config.project_id,
+                api_key_hash=api_key_hash,
+                method=request.method,
+                path=path,
+                endpoint=normalized_path,
+                ip=client_ip,
+                user_agent=user_agent,
+                risk_score=risk_score,
+                decision=Decision.ALLOW.value,
+                reason="Upstream unreachable",
+                status_code=502,
+                latency_ms=latency_ms,
+            )
+            logger.info(ctx.json())
+            asyncio.create_task(emit_traffic_event(ctx.dict()))
+        
+        raise
 
     latency_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -170,7 +218,7 @@ async def gateway(
         api_key_hash=api_key_hash,
         method=request.method,
         path=path,
-        normalized_path=normalized_path,
+        endpoint=normalized_path,
         ip=client_ip,
         user_agent=user_agent,
         risk_score=risk_score,
