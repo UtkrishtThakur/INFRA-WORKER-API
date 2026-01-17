@@ -136,6 +136,82 @@ async def test_no_involuntary_query_validation():
 
                         assert resp.status_code == 200, f"Got error: {resp.text}"
 
+@patch("main.forward_request")
+@patch("main.check_rate_limit")
+@patch("main.compute_risk_score")
+@patch("main.make_decision")
+def test_happy_path_standard_header(mock_decision, mock_risk, mock_limit, mock_forward):
+    """Verify x-api-key (standard) header support"""
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    mock_limit.return_value = (True, 100)
+    mock_risk.return_value = {"risk_score": 0.1}
+    mock_decision.return_value = {"decision": Decision.ALLOW}
+    mock_forward.return_value = MagicMock(status_code=200)
+
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        resp = client.get("/foo", headers={"x-api-key": VALID_KEY})
+        assert resp.status_code == 200
+
+def test_short_api_key_support():
+    """Verify keys < 20 characters are no longer rejected by worker"""
+    short_key = "short-key-123"
+    short_key_hash = hashlib.sha256(short_key.encode()).hexdigest()
+    
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=short_key_hash
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        with patch("main.forward_request", return_value=MagicMock(status_code=200)):
+            with patch("main.check_rate_limit", return_value=(True, 100)):
+                with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                    with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                        resp = client.get("/foo", headers={"x-api-key": short_key})
+                        assert resp.status_code == 200
+
+@pytest.mark.asyncio
+async def test_auth_route_transparency():
+    """
+    Ensure the worker does NOT intercept /auth/login.
+    It should proxy it and return the UPSTREAM's response (even if 401).
+    """
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        # UPSTREAM returns 401 (e.g. invalid user credentials)
+        # We must use a real Response object so FastAPI/TestClient sees the status_code
+        from fastapi import Response
+        mock_response = Response(content="Invalid credentials from backend", status_code=401)
+        
+        # We use AsyncMock because forward_request is an async function
+        with patch("main.forward_request", new_callable=AsyncMock) as mock_forward:
+            mock_forward.return_value = mock_response
+            
+            with patch("main.check_rate_limit", return_value=(True, 100)):
+                with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                    with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                        
+                        resp = client.post(
+                            "/auth/login", 
+                            headers={"x-api-key": VALID_KEY},
+                            json={"user": "foo", "pass": "bar"}
+                        )
+                        
+                        # Worker should return exactly what upstream returned
+                        assert mock_forward.called, "forward_request was NEVER called"
+                        assert resp.status_code == 401
+                        assert "Invalid credentials from backend" in resp.text
+
 @pytest.mark.asyncio
 async def test_traffic_logging_fire_and_forget():
     """

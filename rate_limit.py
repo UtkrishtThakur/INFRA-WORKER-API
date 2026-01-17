@@ -29,40 +29,21 @@ def rate_limit_key(api_key_hash: str, ip_address: str, endpoint: str) -> str:
     return f"rate_limit:{api_key_hash}:{ip_address}:{endpoint}:{_current_minute()}"
 
 
-def classify_endpoint(endpoint: str) -> str:
-    """
-    Very simple v1 endpoint classification.
-    Can be improved later or fetched from Control API.
-    """
-    endpoint = endpoint.lower()
-
-    if "auth" in endpoint or "login" in endpoint or "otp" in endpoint:
-        return "HIGH"
-
-    if "search" in endpoint or "list" in endpoint:
-        return "LOW"
-
-    return DEFAULT_PROFILE
-
-
-# =========================
-# Dynamic Rate Limiter
-# =========================
-
 def check_rate_limit(
     api_key_hash: str,
     ip_address: str,
     endpoint: str,
 ) -> Tuple[bool, int]:
     """
-    Dynamic endpoint-aware rate limiting.
+    Global default rate limiting for all endpoints.
+    SecureX does not classify application routes.
 
     Returns:
         allowed (bool)
         remaining_requests (int)
     """
 
-    profile = classify_endpoint(endpoint)
+    profile = DEFAULT_PROFILE
     limits = ENDPOINT_LIMITS[profile]
 
     rpm = limits["rpm"]

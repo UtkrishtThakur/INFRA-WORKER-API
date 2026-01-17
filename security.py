@@ -8,9 +8,9 @@ from fastapi import HTTPException, status, Request
 def extract_api_key(request: Request) -> str:
     """
     Extract API key from request headers.
-    Header: x-securex-api-key
+    Supports: x-securex-api-key (SecureX) or x-api-key (standard)
     """
-    api_key = request.headers.get("x-securex-api-key")
+    api_key = request.headers.get("x-securex-api-key") or request.headers.get("x-api-key")
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -40,7 +40,7 @@ def validate_api_key(raw_api_key: str) -> str:
     Validate API key format and return hash.
     Project existence is checked elsewhere.
     """
-    if not raw_api_key or len(raw_api_key) < 20:
+    if not raw_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",

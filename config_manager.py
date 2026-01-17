@@ -37,6 +37,10 @@ class ConfigManager:
     def start_background_refresh(self):
         asyncio.create_task(self._refresh_loop())
 
+    async def initialize(self):
+        """Force an initial config fetch (used in tests and startup)"""
+        await self._fetch_and_update()
+
     async def _refresh_loop(self):
         """
         Background config refresh loop with exponential backoff.
