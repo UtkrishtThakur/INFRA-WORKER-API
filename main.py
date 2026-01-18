@@ -27,7 +27,7 @@ logger = logging.getLogger("securex.worker")
 
 
 # ======================================================
-# CORS (Gateway-level, authoritative)
+# CORS (Authoritative at Gateway)
 # ======================================================
 
 CORS_HEADERS = {
@@ -39,7 +39,7 @@ CORS_HEADERS = {
 
 
 # ======================================================
-# Request Context (Facts Only)
+# Request Context (FACTS ONLY)
 # ======================================================
 
 class RequestContext(BaseModel):
@@ -78,7 +78,7 @@ async def startup():
 @app.get("/health")
 def health_check():
     try:
-        _ = config_manager.get_instance()
+        config_manager.get_instance()
         return {"status": "ok"}
     except Exception:
         return {"status": "initializing"}
@@ -90,13 +90,6 @@ def health_check():
 
 @app.options("/{path:path}")
 async def preflight_handler(path: str):
-    """
-    Browser CORS preflight MUST NEVER:
-    - require API key
-    - be rate limited
-    - be proxied upstream
-    - be logged as failure
-    """
     return Response(status_code=200, headers=CORS_HEADERS)
 
 
@@ -117,88 +110,67 @@ async def gateway(
     method = request.method
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent")
-    normalized_path = normalize_path(path)
+
+    canonical_endpoint = normalize_path(path)
 
     # --------------------------------------------------
-    # API Key Validation (Project Identity Only)
+    # API Key Validation (IDENTITY ONLY)
     # --------------------------------------------------
 
     try:
         api_key_hash = validate_api_key(raw_api_key)
     except Exception:
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-
-        ctx = RequestContext(
-            timestamp=datetime.utcnow().isoformat(),
-            project_id="unknown",
-            api_key_hash="invalid",
-            method=method,
-            path=path,
-            endpoint=normalized_path,
-            ip=client_ip,
-            user_agent=user_agent,
-            risk_score=0.0,
-            decision=Decision.BLOCK.value,
-            reason="Missing or invalid API key",
-            status_code=401,
-            latency_ms=latency_ms,
+        return await reject(
+            start_time,
+            "unknown",
+            "invalid",
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            "Missing or invalid API key",
+            401,
         )
 
-        logger.info(ctx.json())
-        asyncio.create_task(emit_traffic_event(ctx.dict()))
+    project = config_manager.get_project_by_key(api_key_hash)
 
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    project_config = config_manager.get_project_by_key(api_key_hash)
-
-    if not project_config:
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-
-        ctx = RequestContext(
-            timestamp=datetime.utcnow().isoformat(),
-            project_id="unknown",
-            api_key_hash=api_key_hash,
-            method=method,
-            path=path,
-            endpoint=normalized_path,
-            ip=client_ip,
-            user_agent=user_agent,
-            risk_score=0.0,
-            decision=Decision.BLOCK.value,
-            reason="Unknown project",
-            status_code=401,
-            latency_ms=latency_ms,
+    if not project:
+        return await reject(
+            start_time,
+            "unknown",
+            api_key_hash,
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            "Unknown project",
+            401,
         )
-
-        logger.info(ctx.json())
-        asyncio.create_task(emit_traffic_event(ctx.dict()))
-
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
     # --------------------------------------------------
-    # Rate Limiting (Soft Enforcement)
+    # Rate Limit (Advisory)
     # --------------------------------------------------
 
     rate_allowed, remaining = check_rate_limit(
         api_key_hash=api_key_hash,
         ip_address=client_ip,
-        endpoint=normalized_path,
+        endpoint=canonical_endpoint,
     )
 
     # --------------------------------------------------
-    # ML Risk Scoring (Advisory)
+    # ML Risk (Advisory)
     # --------------------------------------------------
 
-    ml_result = compute_risk_score(
+    risk_score = compute_risk_score(
         api_key_hash=api_key_hash,
         ip_address=client_ip,
-        endpoint=normalized_path,
-    )
-
-    risk_score = ml_result.get("risk_score", 0.0)
+        endpoint=canonical_endpoint,
+    ).get("risk_score", 0.0)
 
     # --------------------------------------------------
-    # Decision Engine
+    # Decision
     # --------------------------------------------------
 
     decision_result = make_decision(
@@ -214,37 +186,33 @@ async def gateway(
         await asyncio.sleep(0.3)
 
     if decision == Decision.BLOCK:
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-
-        ctx = RequestContext(
-            timestamp=datetime.utcnow().isoformat(),
-            project_id=project_config.project_id,
-            api_key_hash=api_key_hash,
-            method=method,
-            path=path,
-            endpoint=normalized_path,
-            ip=client_ip,
-            user_agent=user_agent,
-            risk_score=risk_score,
-            decision=decision.value,
-            reason=reason,
-            status_code=429,
-            latency_ms=latency_ms,
-        )
-
-        logger.info(ctx.json())
-        asyncio.create_task(emit_traffic_event(ctx.dict()))
-
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=reason or "Request blocked",
+        return await reject(
+            start_time,
+            project.project_id,
+            api_key_hash,
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            reason or "Blocked",
+            429,
+            risk_score,
         )
 
     # --------------------------------------------------
-    # Forward to Upstream (Transparent)
+    # 🔥 PATH NORMALIZATION (CRITICAL FIX)
     # --------------------------------------------------
 
-    upstream_url = f"{project_config.upstream_base_url.rstrip('/')}/{path}"
+    clean_path = strip_api_prefix(path)
+
+    upstream_url = (
+        f"{project.upstream_base_url.rstrip('/')}/{clean_path}"
+    )
+
+    # --------------------------------------------------
+    # Forward (TRANSPARENT)
+    # --------------------------------------------------
 
     try:
         response = await forward_request(
@@ -252,56 +220,36 @@ async def gateway(
             upstream_url=upstream_url,
         )
     except HTTPException as e:
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-
-        ctx = RequestContext(
-            timestamp=datetime.utcnow().isoformat(),
-            project_id=project_config.project_id,
-            api_key_hash=api_key_hash,
-            method=method,
-            path=path,
-            endpoint=normalized_path,
-            ip=client_ip,
-            user_agent=user_agent,
-            risk_score=risk_score,
-            decision=Decision.ALLOW.value,
-            reason="Upstream error",
-            status_code=e.status_code,
-            latency_ms=latency_ms,
+        await emit_event(
+            start_time,
+            project.project_id,
+            api_key_hash,
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            risk_score,
+            Decision.ALLOW.value,
+            "Upstream error",
+            e.status_code,
         )
-
-        logger.info(ctx.json())
-        asyncio.create_task(emit_traffic_event(ctx.dict()))
         raise
 
-    # --------------------------------------------------
-    # Emit Success Event (Fire-and-Forget)
-    # --------------------------------------------------
-
-    latency_ms = int((time.monotonic() - start_time) * 1000)
-
-    ctx = RequestContext(
-        timestamp=datetime.utcnow().isoformat(),
-        project_id=project_config.project_id,
-        api_key_hash=api_key_hash,
-        method=method,
-        path=path,
-        endpoint=normalized_path,
-        ip=client_ip,
-        user_agent=user_agent,
-        risk_score=risk_score,
-        decision=Decision.ALLOW.value,
-        reason=None,
-        status_code=response.status_code,
-        latency_ms=latency_ms,
+    await emit_event(
+        start_time,
+        project.project_id,
+        api_key_hash,
+        method,
+        path,
+        canonical_endpoint,
+        client_ip,
+        user_agent,
+        risk_score,
+        Decision.ALLOW.value,
+        None,
+        response.status_code,
     )
-
-    logger.info(ctx.json())
-    asyncio.create_task(emit_traffic_event(ctx.dict()))
-
-    # --------------------------------------------------
-    # Ensure CORS Headers on ALL responses
-    # --------------------------------------------------
 
     for k, v in CORS_HEADERS.items():
         response.headers.setdefault(k, v)
@@ -310,15 +258,87 @@ async def gateway(
 
 
 # ======================================================
-# Utils
+# Helpers
 # ======================================================
 
+def strip_api_prefix(path: str) -> str:
+    """
+    Prevent /api/api duplication.
+    """
+    if path.startswith("api/"):
+        return path[len("api/"):]
+    return path
+
+
 def normalize_path(path: str) -> str:
-    """
-    Deterministic canonical path for analytics.
-    """
     return "/" + "/".join(
         ":id" if segment.isdigit() else segment
         for segment in path.split("/")
         if segment
     )
+
+
+async def emit_event(
+    start_time,
+    project_id,
+    api_key_hash,
+    method,
+    path,
+    endpoint,
+    ip,
+    user_agent,
+    risk_score,
+    decision,
+    reason,
+    status_code,
+):
+    latency_ms = int((time.monotonic() - start_time) * 1000)
+
+    ctx = RequestContext(
+        timestamp=datetime.utcnow().isoformat(),
+        project_id=project_id,
+        api_key_hash=api_key_hash,
+        method=method,
+        path=path,
+        endpoint=endpoint,
+        ip=ip,
+        user_agent=user_agent,
+        risk_score=risk_score,
+        decision=decision,
+        reason=reason,
+        status_code=status_code,
+        latency_ms=latency_ms,
+    )
+
+    logger.info(ctx.json())
+    asyncio.create_task(emit_traffic_event(ctx.dict()))
+
+
+async def reject(
+    start_time,
+    project_id,
+    api_key_hash,
+    method,
+    path,
+    endpoint,
+    ip,
+    user_agent,
+    reason,
+    status_code,
+    risk_score=0.0,
+):
+    await emit_event(
+        start_time,
+        project_id,
+        api_key_hash,
+        method,
+        path,
+        endpoint,
+        ip,
+        user_agent,
+        risk_score,
+        Decision.BLOCK.value,
+        reason,
+        status_code,
+    )
+    raise HTTPException(status_code=status_code, detail=reason)
