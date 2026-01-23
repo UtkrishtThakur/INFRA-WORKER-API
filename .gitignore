@@ -1,1 +1,17 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Env
 .env
+.env.*
+
+# Node / Next
+node_modules/
+.next/
+
+# Docker
+*.log
+
