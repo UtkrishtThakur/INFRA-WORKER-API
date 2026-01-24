@@ -213,6 +213,57 @@ async def test_auth_route_transparency():
                         assert "Invalid credentials from backend" in resp.text
 
 @pytest.mark.asyncio
+async def test_options_preflight_transparency():
+    """Verify that OPTIONS requests are forwarded and NOT intercepted by worker."""
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        from fastapi import Response
+        # upstream returns a custom response for OPTIONS
+        mock_response = Response(status_code=204)
+        mock_response.headers["x-upstream-cors"] = "true"
+        
+        with patch("main.forward_request", new_callable=AsyncMock) as mock_forward:
+            mock_forward.return_value = mock_response
+            
+            with patch("main.check_rate_limit", return_value=(True, 100)):
+                with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                    with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                        resp = client.options("/some/route", headers={"x-api-key": VALID_KEY})
+                        
+                        assert mock_forward.called
+                        assert resp.status_code == 204
+                        assert resp.headers.get("x-upstream-cors") == "true"
+                        # Crucially, worker hardcoded CORS headers should NOT be present unless upstream sent them
+                        assert "Access-Control-Allow-Origin" not in resp.headers
+
+@pytest.mark.asyncio
+async def test_no_path_stripping():
+    """Verify that /api/... paths are NOT mutated before forwarding."""
+    project_config = ProjectConfig(
+        project_id=PROJECT_ID,
+        upstream_base_url=UPSTREAM_URL,
+        api_key_hash=VALID_KEY_HASH
+    )
+    
+    with patch.object(config_manager, "get_project_by_key", return_value=project_config):
+        with patch("main.forward_request", new_callable=AsyncMock) as mock_forward:
+            mock_forward.return_value = MagicMock(status_code=200)
+            
+            with patch("main.check_rate_limit", return_value=(True, 100)):
+                with patch("main.compute_risk_score", return_value={"risk_score": 0.0}):
+                    with patch("main.make_decision", return_value={"decision": Decision.ALLOW}):
+                        client.get("/api/v1/users", headers={"x-api-key": VALID_KEY})
+                        
+                        # Check the upstream_url passed to forward_request
+                        called_url = mock_forward.call_args[1]["upstream_url"]
+                        assert called_url.endswith("/api/v1/users")
+
+@pytest.mark.asyncio
 async def test_traffic_logging_fire_and_forget():
     """
     Ensure traffic logging is attempted and doesn't break request on failure.

@@ -27,18 +27,6 @@ logger = logging.getLogger("securex.worker")
 
 
 # ======================================================
-# CORS (Authoritative at Gateway)
-# ======================================================
-
-CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Max-Age": "86400",
-}
-
-
-# ======================================================
 # Request Context (FACTS ONLY)
 # ======================================================
 
@@ -85,21 +73,12 @@ def health_check():
 
 
 # ======================================================
-# Preflight (ABSOLUTE BYPASS)
-# ======================================================
-
-@app.options("/{path:path}")
-async def preflight_handler(path: str):
-    return Response(status_code=200, headers=CORS_HEADERS)
-
-
-# ======================================================
 # Gateway (ALL REAL TRAFFIC)
 # ======================================================
 
 @app.api_route(
     "/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "TRACE"],
 )
 async def gateway(
     path: str,
@@ -145,7 +124,7 @@ async def gateway(
             canonical_endpoint,
             client_ip,
             user_agent,
-            "Unknown project",
+            "Invalid API key",
             401,
         )
 
@@ -200,14 +179,8 @@ async def gateway(
             risk_score,
         )
 
-    # --------------------------------------------------
-    # 🔥 PATH NORMALIZATION (CRITICAL FIX)
-    # --------------------------------------------------
-
-    clean_path = strip_api_prefix(path)
-
     upstream_url = (
-        f"{project.upstream_base_url.rstrip('/')}/{clean_path}"
+        f"{project.upstream_base_url.rstrip('/')}/{path}"
     )
 
     # --------------------------------------------------
@@ -251,24 +224,12 @@ async def gateway(
         response.status_code,
     )
 
-    for k, v in CORS_HEADERS.items():
-        response.headers.setdefault(k, v)
-
     return response
 
 
 # ======================================================
 # Helpers
 # ======================================================
-
-def strip_api_prefix(path: str) -> str:
-    """
-    Prevent /api/api duplication.
-    """
-    if path.startswith("api/"):
-        return path[len("api/"):]
-    return path
-
 
 def normalize_path(path: str) -> str:
     return "/" + "/".join(

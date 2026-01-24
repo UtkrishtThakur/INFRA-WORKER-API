@@ -1,0 +1,18 @@
+services:
+  securex-worker-api:
+    build: .
+    container_name: securex-worker-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: securex-worker-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
