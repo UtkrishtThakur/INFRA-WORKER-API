@@ -1,61 +1,92 @@
-import httpx
 import asyncio
 import logging
-from typing import Optional
+import httpx
+from typing import Dict
 from config import settings
 
 logger = logging.getLogger("securex.worker.traffic")
 
+# ---- TUNABLE SAFETY LIMITS ----
+QUEUE_MAX_SIZE = 1000        # Max logs kept in memory
+SEND_TIMEOUT = 0.3           # Hard timeout per request (seconds)
+MAX_CONNECTIONS = 50
+KEEPALIVE_CONNECTIONS = 10
 
-async def emit_traffic_event(event: dict) -> None:
+# ---- INTERNAL STATE ----
+_log_queue: asyncio.Queue[Dict] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+_worker_started = False
+
+
+# ---- SHARED HTTP CLIENT (IMPORTANT) ----
+_http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(SEND_TIMEOUT),
+    limits=httpx.Limits(
+        max_connections=MAX_CONNECTIONS,
+        max_keepalive_connections=KEEPALIVE_CONNECTIONS,
+    ),
+)
+
+
+async def _traffic_worker():
     """
-    Fire-and-forget traffic export to Control API.
-    
-    Design guarantees:
-    - NEVER blocks request flow (background task only)
-    - Hard 500ms timeout enforced
-    - Retries with exponential backoff (50ms, 100ms)
-    - Single error log on permanent failure (no spam)
-    - All exceptions swallowed
-    
-    Payload contract:
-    - Sends to POST /internal/traffic ONLY
-    - Field 'endpoint' contains normalized path (canonical routing identifier)
+    Background worker that drains the log queue.
+    This runs forever and MUST NEVER crash.
     """
-    if not settings.CONTROL_API_BASE_URL:
+    while True:
+        event = await _log_queue.get()
+        try:
+            await _http_client.post(
+                f"{settings.CONTROL_API_BASE_URL}/internal/traffic",
+                json=event,
+                headers={
+                    "x-control-secret": settings.CONTROL_WORKER_SHARED_SECRET
+                },
+            )
+        except Exception:
+            # Silent drop: control plane MUST NOT affect data plane
+            pass
+        finally:
+            _log_queue.task_done()
+
+
+def start_traffic_logger():
+    """
+    Must be called ONCE on worker startup.
+    """
+    global _worker_started
+
+    if _worker_started:
         return
 
-    # Rename normalized_path to endpoint for Control API schema alignment
+    if not settings.CONTROL_API_BASE_URL:
+        logger.warning("Traffic logging disabled: CONTROL_API_BASE_URL not set")
+        return
+
+    asyncio.create_task(_traffic_worker())
+    _worker_started = True
+
+
+def emit_traffic_event(event: Dict) -> None:
+    """
+    TRUE fire-and-forget traffic emission.
+
+    Guarantees:
+    - Zero await
+    - Never blocks request path
+    - Bounded memory
+    - Control plane can be DEAD
+    """
+
+    if not _worker_started:
+        # If logger isn't ready, drop silently
+        return
+
+    # Normalize schema
     if "normalized_path" in event:
         event["endpoint"] = event.pop("normalized_path")
 
-    max_retries = 2
-    retry_delays = [0.05, 0.1]  # 50ms, 100ms
-    
-    for attempt in range(max_retries + 1):
-        try:
-            # Hard timeout: 500ms total for the entire request
-            async with httpx.AsyncClient(timeout=0.5) as client:
-                await client.post(
-                    f"{settings.CONTROL_API_BASE_URL}/internal/traffic",
-                    json=event,
-                    headers={"x-control-secret": settings.CONTROL_WORKER_SHARED_SECRET}
-                )
-            # Success - exit immediately
-            return
-            
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
-            # Retry on network/timeout errors
-            if attempt < max_retries:
-                await asyncio.sleep(retry_delays[attempt])
-                continue
-            else:
-                # Permanent failure after all retries - log once
-                logger.error(
-                    f"Traffic emission failed permanently after {max_retries + 1} attempts: {type(e).__name__}"
-                )
-                
-        except Exception as e:
-            # Unexpected error - log and swallow to prevent worker crash
-            logger.error(f"Unexpected error in traffic emission: {type(e).__name__}: {str(e)}")
-            return
+    try:
+        _log_queue.put_nowait(event)
+    except asyncio.QueueFull:
+        # Drop logs when under pressure — THIS IS CORRECT
+        pass
