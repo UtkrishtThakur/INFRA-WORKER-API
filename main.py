@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, Request, Depends, HTTPException, status, Response
+from fastapi import FastAPI, Request, Depends, HTTPException
 from pydantic import BaseModel
 
 from config_manager import config_manager
@@ -27,7 +27,7 @@ logger = logging.getLogger("securex.worker")
 
 
 # ======================================================
-# Request Context (FACTS ONLY)
+# Request Context (FACTS ONLY — NO DERIVED LOGIC)
 # ======================================================
 
 class RequestContext(BaseModel):
@@ -73,7 +73,7 @@ def health_check():
 
 
 # ======================================================
-# Gateway (ALL REAL TRAFFIC)
+# Gateway (ALL REAL TRAFFIC PASSES HERE)
 # ======================================================
 
 @app.api_route(
@@ -86,6 +86,7 @@ async def gateway(
     raw_api_key: str = Depends(extract_api_key),
 ):
     start_time = time.monotonic()
+
     method = request.method
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent")
@@ -100,36 +101,36 @@ async def gateway(
         api_key_hash = validate_api_key(raw_api_key)
     except Exception:
         return await reject(
-            start_time,
-            "unknown",
-            "invalid",
-            method,
-            path,
-            canonical_endpoint,
-            client_ip,
-            user_agent,
-            "Missing or invalid API key",
-            401,
+            start_time=start_time,
+            project_id="unknown",
+            api_key_hash="invalid",
+            method=method,
+            path=path,
+            endpoint=canonical_endpoint,
+            ip=client_ip,
+            user_agent=user_agent,
+            reason="Missing or invalid API key",
+            status_code=401,
         )
 
     project = config_manager.get_project_by_key(api_key_hash)
 
     if not project:
         return await reject(
-            start_time,
-            "unknown",
-            api_key_hash,
-            method,
-            path,
-            canonical_endpoint,
-            client_ip,
-            user_agent,
-            "Invalid API key",
-            401,
+            start_time=start_time,
+            project_id="unknown",
+            api_key_hash=api_key_hash,
+            method=method,
+            path=path,
+            endpoint=canonical_endpoint,
+            ip=client_ip,
+            user_agent=user_agent,
+            reason="Invalid API key",
+            status_code=401,
         )
 
     # --------------------------------------------------
-    # Rate Limit (Advisory)
+    # Rate Limit (ADVISORY)
     # --------------------------------------------------
 
     rate_allowed, remaining = check_rate_limit(
@@ -139,7 +140,7 @@ async def gateway(
     )
 
     # --------------------------------------------------
-    # ML Risk (Advisory)
+    # ML Risk (ADVISORY)
     # --------------------------------------------------
 
     risk_score = compute_risk_score(
@@ -166,26 +167,24 @@ async def gateway(
 
     if decision == Decision.BLOCK:
         return await reject(
-            start_time,
-            project.project_id,
-            api_key_hash,
-            method,
-            path,
-            canonical_endpoint,
-            client_ip,
-            user_agent,
-            reason or "Blocked",
-            429,
-            risk_score,
+            start_time=start_time,
+            project_id=project.project_id,
+            api_key_hash=api_key_hash,
+            method=method,
+            path=path,
+            endpoint=canonical_endpoint,
+            ip=client_ip,
+            user_agent=user_agent,
+            reason=reason or "Blocked",
+            status_code=429,
+            risk_score=risk_score,
         )
 
-    upstream_url = (
-        f"{project.upstream_base_url.rstrip('/')}/{path}"
-    )
+    # --------------------------------------------------
+    # Forward (TRANSPARENT PROXY)
+    # --------------------------------------------------
 
-    # --------------------------------------------------
-    # Forward (TRANSPARENT)
-    # --------------------------------------------------
+    upstream_url = f"{project.upstream_base_url.rstrip('/')}/{path}"
 
     try:
         response = await forward_request(
@@ -194,34 +193,34 @@ async def gateway(
         )
     except HTTPException as e:
         await emit_event(
-            start_time,
-            project.project_id,
-            api_key_hash,
-            method,
-            path,
-            canonical_endpoint,
-            client_ip,
-            user_agent,
-            risk_score,
-            Decision.ALLOW.value,
-            "Upstream error",
-            e.status_code,
+            start_time=start_time,
+            project_id=project.project_id,
+            api_key_hash=api_key_hash,
+            method=method,
+            path=path,
+            endpoint=canonical_endpoint,
+            ip=client_ip,
+            user_agent=user_agent,
+            risk_score=risk_score,
+            decision=Decision.ALLOW.value,
+            reason="Upstream error",
+            status_code=e.status_code,
         )
         raise
 
     await emit_event(
-        start_time,
-        project.project_id,
-        api_key_hash,
-        method,
-        path,
-        canonical_endpoint,
-        client_ip,
-        user_agent,
-        risk_score,
-        Decision.ALLOW.value,
-        None,
-        response.status_code,
+        start_time=start_time,
+        project_id=project.project_id,
+        api_key_hash=api_key_hash,
+        method=method,
+        path=path,
+        endpoint=canonical_endpoint,
+        ip=client_ip,
+        user_agent=user_agent,
+        risk_score=risk_score,
+        decision=Decision.ALLOW.value,
+        reason=None,
+        status_code=response.status_code,
     )
 
     return response
@@ -272,7 +271,9 @@ async def emit_event(
     )
 
     logger.info(ctx.json())
-    asyncio.create_task(emit_traffic_event(ctx.dict()))
+
+    # ✅ TRUE FIRE-AND-FORGET (DO NOT AWAIT, DO NOT CREATE TASK)
+    emit_traffic_event(ctx.dict())
 
 
 async def reject(
@@ -289,17 +290,17 @@ async def reject(
     risk_score=0.0,
 ):
     await emit_event(
-        start_time,
-        project_id,
-        api_key_hash,
-        method,
-        path,
-        endpoint,
-        ip,
-        user_agent,
-        risk_score,
-        Decision.BLOCK.value,
-        reason,
-        status_code,
+        start_time=start_time,
+        project_id=project_id,
+        api_key_hash=api_key_hash,
+        method=method,
+        path=path,
+        endpoint=endpoint,
+        ip=ip,
+        user_agent=user_agent,
+        risk_score=risk_score,
+        decision=Decision.BLOCK.value,
+        reason=reason,
+        status_code=status_code,
     )
     raise HTTPException(status_code=status_code, detail=reason)
