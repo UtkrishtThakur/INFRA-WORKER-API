@@ -13,7 +13,7 @@ from rate_limit import check_rate_limit
 from ml import compute_risk_score
 from decision import make_decision, Decision
 from proxy import forward_request
-from traffic_logger import emit_traffic_event
+from traffic_logger import emit_traffic_event, start_traffic_logger, is_logger_ready
 
 
 # ======================================================
@@ -27,7 +27,7 @@ logger = logging.getLogger("securex.worker")
 
 
 # ======================================================
-# Request Context (FACTS ONLY — NO DERIVED LOGIC)
+# Request Context (FACTS ONLY)
 # ======================================================
 
 class RequestContext(BaseModel):
@@ -57,6 +57,8 @@ class RequestContext(BaseModel):
 @app.on_event("startup")
 async def startup():
     config_manager.start_background_refresh()
+    start_traffic_logger()
+    logger.info("Traffic logger started")
 
 
 # ======================================================
@@ -73,7 +75,7 @@ def health_check():
 
 
 # ======================================================
-# Gateway (ALL REAL TRAFFIC PASSES HERE)
+# Gateway (ALL REAL TRAFFIC)
 # ======================================================
 
 @app.api_route(
@@ -94,43 +96,42 @@ async def gateway(
     canonical_endpoint = normalize_path(path)
 
     # --------------------------------------------------
-    # API Key Validation (IDENTITY ONLY)
+    # API Key Validation
     # --------------------------------------------------
 
     try:
         api_key_hash = validate_api_key(raw_api_key)
     except Exception:
-        return await reject(
-            start_time=start_time,
-            project_id="unknown",
-            api_key_hash="invalid",
-            method=method,
-            path=path,
-            endpoint=canonical_endpoint,
-            ip=client_ip,
-            user_agent=user_agent,
-            reason="Missing or invalid API key",
-            status_code=401,
+        await reject(
+            start_time,
+            "unknown",
+            "invalid",
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            "Missing or invalid API key",
+            401,
         )
 
     project = config_manager.get_project_by_key(api_key_hash)
-
     if not project:
-        return await reject(
-            start_time=start_time,
-            project_id="unknown",
-            api_key_hash=api_key_hash,
-            method=method,
-            path=path,
-            endpoint=canonical_endpoint,
-            ip=client_ip,
-            user_agent=user_agent,
-            reason="Invalid API key",
-            status_code=401,
+        await reject(
+            start_time,
+            "unknown",
+            api_key_hash,
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            "Invalid API key",
+            401,
         )
 
     # --------------------------------------------------
-    # Rate Limit (ADVISORY)
+    # Rate Limit + ML Risk
     # --------------------------------------------------
 
     rate_allowed, remaining = check_rate_limit(
@@ -139,19 +140,11 @@ async def gateway(
         endpoint=canonical_endpoint,
     )
 
-    # --------------------------------------------------
-    # ML Risk (ADVISORY)
-    # --------------------------------------------------
-
     risk_score = compute_risk_score(
         api_key_hash=api_key_hash,
         ip_address=client_ip,
         endpoint=canonical_endpoint,
     ).get("risk_score", 0.0)
-
-    # --------------------------------------------------
-    # Decision
-    # --------------------------------------------------
 
     decision_result = make_decision(
         rate_limit_allowed=rate_allowed,
@@ -166,61 +159,58 @@ async def gateway(
         await asyncio.sleep(0.3)
 
     if decision == Decision.BLOCK:
-        return await reject(
-            start_time=start_time,
-            project_id=project.project_id,
-            api_key_hash=api_key_hash,
-            method=method,
-            path=path,
-            endpoint=canonical_endpoint,
-            ip=client_ip,
-            user_agent=user_agent,
-            reason=reason or "Blocked",
-            status_code=429,
-            risk_score=risk_score,
+        await reject(
+            start_time,
+            project.project_id,
+            api_key_hash,
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            reason or "Blocked",
+            429,
+            risk_score,
         )
 
     # --------------------------------------------------
-    # Forward (TRANSPARENT PROXY)
+    # Forward
     # --------------------------------------------------
 
     upstream_url = f"{project.upstream_base_url.rstrip('/')}/{path}"
 
     try:
-        response = await forward_request(
-            request=request,
-            upstream_url=upstream_url,
-        )
+        response = await forward_request(request, upstream_url)
     except HTTPException as e:
-        await emit_event(
-            start_time=start_time,
-            project_id=project.project_id,
-            api_key_hash=api_key_hash,
-            method=method,
-            path=path,
-            endpoint=canonical_endpoint,
-            ip=client_ip,
-            user_agent=user_agent,
-            risk_score=risk_score,
-            decision=Decision.ALLOW.value,
-            reason="Upstream error",
-            status_code=e.status_code,
+        emit_event(
+            start_time,
+            project.project_id,
+            api_key_hash,
+            method,
+            path,
+            canonical_endpoint,
+            client_ip,
+            user_agent,
+            risk_score,
+            Decision.ALLOW.value,
+            "Upstream error",
+            e.status_code,
         )
         raise
 
-    await emit_event(
-        start_time=start_time,
-        project_id=project.project_id,
-        api_key_hash=api_key_hash,
-        method=method,
-        path=path,
-        endpoint=canonical_endpoint,
-        ip=client_ip,
-        user_agent=user_agent,
-        risk_score=risk_score,
-        decision=Decision.ALLOW.value,
-        reason=None,
-        status_code=response.status_code,
+    emit_event(
+        start_time,
+        project.project_id,
+        api_key_hash,
+        method,
+        path,
+        canonical_endpoint,
+        client_ip,
+        user_agent,
+        risk_score,
+        Decision.ALLOW.value,
+        None,
+        response.status_code,
     )
 
     return response
@@ -238,7 +228,7 @@ def normalize_path(path: str) -> str:
     )
 
 
-async def emit_event(
+def emit_event(
     start_time,
     project_id,
     api_key_hash,
@@ -272,8 +262,15 @@ async def emit_event(
 
     logger.info(ctx.json())
 
-    # ✅ TRUE FIRE-AND-FORGET (DO NOT AWAIT, DO NOT CREATE TASK)
-    emit_traffic_event(ctx.dict())
+    # 🔒 SAFE FIRE-AND-FORGET
+    if not is_logger_ready():
+        logger.warning("Traffic logger not ready — dropping event")
+        return
+
+    try:
+        emit_traffic_event(ctx.dict())
+    except Exception as e:
+        logger.error(f"Traffic enqueue failed: {e}", exc_info=True)
 
 
 async def reject(
@@ -289,18 +286,18 @@ async def reject(
     status_code,
     risk_score=0.0,
 ):
-    await emit_event(
-        start_time=start_time,
-        project_id=project_id,
-        api_key_hash=api_key_hash,
-        method=method,
-        path=path,
-        endpoint=endpoint,
-        ip=ip,
-        user_agent=user_agent,
-        risk_score=risk_score,
-        decision=Decision.BLOCK.value,
-        reason=reason,
-        status_code=status_code,
+    emit_event(
+        start_time,
+        project_id,
+        api_key_hash,
+        method,
+        path,
+        endpoint,
+        ip,
+        user_agent,
+        risk_score,
+        Decision.BLOCK.value,
+        reason,
+        status_code,
     )
     raise HTTPException(status_code=status_code, detail=reason)
