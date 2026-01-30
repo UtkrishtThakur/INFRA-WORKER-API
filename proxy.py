@@ -1,9 +1,12 @@
 import httpx
-from typing import Dict, Generator
+from typing import Dict
 
 from fastapi import Request, HTTPException, status
 from fastapi.responses import StreamingResponse
 
+# --------------------------------------------------
+# Hop-by-hop headers (RFC compliant)
+# --------------------------------------------------
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -14,15 +17,11 @@ HOP_BY_HOP_HEADERS = {
     "trailers",
     "transfer-encoding",
     "upgrade",
-    "host",  # Let httpx set the host header based on URL
+    "host",
 }
 
 
 def _filter_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    """
-    Remove hop-by-hop headers as per RFC 2616.
-    These must not be forwarded by proxies.
-    """
     return {
         k: v
         for k, v in headers.items()
@@ -30,43 +29,61 @@ def _filter_headers(headers: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+# --------------------------------------------------
+# SHARED HTTP CLIENT (IMPORTANT)
+# --------------------------------------------------
+
+_client: httpx.AsyncClient | None = None
+
+
+def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=30.0)
+    return _client
+
+
+async def close_client():
+    global _client
+    if _client:
+        await _client.aclose()
+        _client = None
+
+
+# --------------------------------------------------
+# Proxy Forwarder
+# --------------------------------------------------
+
 async def forward_request(
     *,
     request: Request,
     upstream_url: str,
 ) -> StreamingResponse:
     """
-    Forward the incoming request to the upstream service
-    and return the upstream response transparently using streaming.
+    Transparently forward request to upstream and stream response back.
     """
-    client = httpx.AsyncClient(timeout=30.0)
+    client = get_client()
 
     try:
-        req = client.build_request(
+        upstream_req = client.build_request(
             method=request.method,
             url=upstream_url,
             headers=_filter_headers(dict(request.headers)),
             params=request.query_params,
             content=request.stream(),
         )
-        
-        r = await client.send(req, stream=True)
-        
+
+        upstream_resp = await client.send(upstream_req, stream=True)
+
         return StreamingResponse(
-            r.aiter_raw(),
-            status_code=r.status_code,
-            headers=_filter_headers(dict(r.headers)),
-            media_type=r.headers.get("content-type"),
-            background=None,  # Optimization: explicit none if we don't have bg tasks
+            upstream_resp.aiter_raw(),
+            status_code=upstream_resp.status_code,
+            headers=_filter_headers(dict(upstream_resp.headers)),
+            media_type=upstream_resp.headers.get("content-type"),
         )
 
     except httpx.RequestError as e:
-        await client.aclose()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Upstream service unreachable: {str(e)}",
         )
-    except Exception:
-        await client.aclose()
-        raise
-
