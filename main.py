@@ -223,12 +223,57 @@ async def gateway(
 # Helpers
 # ======================================================
 
+import re
+
+# Regex for UUIDs
+UUID_REGEX = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+# Regex for MongoDB ObjectIDs (24 hex chars)
+OBJECT_ID_REGEX = re.compile(r'^[0-9a-f]{24}$', re.IGNORECASE)
+
 def normalize_path(path: str) -> str:
-    return "/" + "/".join(
-        ":id" if segment.isdigit() else segment
-        for segment in path.split("/")
-        if segment
-    )
+    """
+    Canonical normalization of request paths.
+    
+    Handles:
+    - UUIDs -> :id
+    - MongoDB ObjectIDs -> :id
+    - Numeric IDs -> :id
+    - Long hex strings (>7 chars) -> :id
+    """
+    if not path:
+        return "/"
+        
+    segments = path.strip("/").split("/")
+    normalized_segments = []
+    
+    for segment in segments:
+        if not segment:
+            continue
+            
+        # 1. UUID
+        if UUID_REGEX.match(segment):
+            normalized_segments.append(":id")
+            continue
+            
+        # 2. ObjectID
+        if OBJECT_ID_REGEX.match(segment):
+            normalized_segments.append(":id")
+            continue
+            
+        # 3. Numeric ID
+        if segment.isdigit():
+            normalized_segments.append(":id")
+            continue
+
+        # 4. Long Hex/Alphanumeric ID (Heuristic)
+        # Matches typical random IDs like '98af7e6c'
+        if len(segment) >= 8 and re.match(r'^[0-9a-fA-F]+$', segment):
+            normalized_segments.append(":id")
+            continue
+            
+        normalized_segments.append(segment)
+        
+    return "/" + "/".join(normalized_segments)
 
 
 def emit_event(

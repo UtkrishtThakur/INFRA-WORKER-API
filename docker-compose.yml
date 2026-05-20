@@ -1,18 +1,35 @@
+version: '3.9'
+
 services:
-  securex-worker-api:
+  worker:
     build: .
-    container_name: securex-worker-api
+    container_name: dev-worker
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
       - .:/app
+    environment:
+      - REDIS_URL=redis://default:password@dev-redis:6379
+      - CONTROL_API_BASE_URL=http://control-api:8000
+    env_file:
+      - .env
+    labels:
+      - "traefik.enable=false"
     depends_on:
-      - redis
-    restart: unless-stopped
+      dev-redis:
+        condition: service_healthy
+    command: [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload" ]
 
-  redis:
+  dev-redis:
     image: redis:7-alpine
-    container_name: securex-worker-redis
+    container_name: dev-worker-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
-    restart: unless-stopped
+    command: [ "redis-server", "--requirepass", "password" ]
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5

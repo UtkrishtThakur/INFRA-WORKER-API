@@ -1,0 +1,45 @@
+version: '3.9'
+
+networks:
+  internal:
+    external: true
+  traefik-public:
+    external: true
+
+services:
+  worker:
+    build: .
+    container_name: prod-worker
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    environment:
+      - CONTROL_API_BASE_URL=http://control-api:8000
+    networks:
+      - internal
+      - traefik-public
+    depends_on:
+      prod-redis:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-public"
+      - "traefik.http.routers.worker.rule=Host(`gateway.devlooper.co.in`)"
+      - "traefik.http.routers.worker.entrypoints=websecure"
+      - "traefik.http.routers.worker.tls.certresolver=le"
+      - "traefik.http.services.worker.loadbalancer.server.port=8000"
+
+  prod-redis:
+    image: redis:7-alpine
+    container_name: prod-worker-redis
+    restart: unless-stopped
+    command: [ "redis-server", "--requirepass", "${REDIS_PASSWORD:-password}" ]
+    networks:
+      - internal
+    healthcheck:
+      test: [ "CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-password}\" ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
